@@ -1,0 +1,271 @@
+//@version=6
+indicator("Dominant Cycle Phased Clouds", overlay=true, timeframe="", timeframe_gaps=true)
+
+// Imports
+// ─────────────────────────────
+//@function Autocorrelation periodogram dominant cycle estimator
+//@doc https://github.com/mihakralj/pinescript/blob/main/indicators/cycles/eacp.md
+//@param source Price input series
+//@param minPeriod Minimum period to evaluate
+//@param maxPeriod Maximum period to evaluate
+//@param avgLength Averaging length for Pearson correlation (0 uses lag length)
+//@param enhance Apply cubic emphasis to highlight dominant peaks
+//@returns Smoothed dominant cycle estimate
+//@optimized Removed buffer complexity, uses native PineScript historical operator for O(n) correlation
+//@validation wolfram:"Wiener-Khinchin theorem","Pearson correlation coefficient" external:"TradingView TASC 2025.02 Autocorrelation","ImmortalFreedom Ehlers ACP","QuantStrat autocorrPeriodogram"
+// Function sourced from QuanTAlib by mihakralj, available under the Apache 2.0 License.
+acp_dc(series float source,simple int minPeriod,simple int maxPeriod,simple int avgLength = 3,simple bool enhance = true)=>
+    if minPeriod<3
+        runtime.error("Min period must be at least 3")
+    if maxPeriod<=minPeriod
+        runtime.error("Max period must be greater than min period")
+    if avgLength<0
+        runtime.error("Average length must be non-negative")
+    int size=maxPeriod+1
+    var array<float> corr=array.new_float(0)
+    var array<float> power=array.new_float(0)
+    var array<float> smooth=array.new_float(0)
+    var int storedSize=0
+    var int storedMin=0
+    var int storedMax=0
+    var bool configured=false
+    var float hp=0.0
+    var float filt=0.0
+    var float dom=0.0
+    var float domPower=0.0
+    var float maxPwr=0.0
+    var float e=1.0
+    var bool warmup=true
+    if not configured or storedSize!=size or storedMin!=minPeriod or storedMax!=maxPeriod
+        corr:=array.new_float(size,0.0)
+        power:=array.new_float(size,0.0)
+        smooth:=array.new_float(size,0.0)
+        storedSize:=size
+        storedMin:=minPeriod
+        storedMax:=maxPeriod
+        configured:=true
+        hp:=0.0
+        filt:=0.0
+        dom:=(minPeriod+maxPeriod)*0.5
+        domPower:=0.0
+        maxPwr:=0.0
+        e:=1.0
+        warmup:=true
+    float price=nz(source)
+    float alphaHP=(math.cos(math.sqrt(2.0)*math.pi/float(maxPeriod))+math.sin(math.sqrt(2.0)*math.pi/float(maxPeriod))-1.0)/math.cos(math.sqrt(2.0)*math.pi/float(maxPeriod))
+    hp:=math.pow(1.0-alphaHP/2.0,2.0)*(price-2.0*nz(price[1])+nz(price[2]))+2.0*(1.0-alphaHP)*nz(hp[1])-math.pow(1.0-alphaHP,2.0)*nz(hp[2])
+    float a1=math.exp(-math.sqrt(2.0)*math.pi/float(minPeriod))
+    float b1=2.0*a1*math.cos(math.sqrt(2.0)*math.pi/float(minPeriod))
+    float c2=b1
+    float c3=-(a1*a1)
+    float c1=1.0-c2-c3
+    filt:=c1*(hp+nz(hp[1]))*0.5+c2*nz(filt[1])+c3*nz(filt[2])
+    for lag=0 to maxPeriod
+        if lag<2
+            array.set(corr,lag,0.0)
+        else
+            int window=avgLength==0?lag:avgLength
+            if window<2
+                window:=2
+            float sx=0.0
+            float sy=0.0
+            float sxx=0.0
+            float syy=0.0
+            float sxy=0.0
+            int valid=0
+            for k=0 to window-1
+                float x=nz(filt[k])
+                float y=nz(filt[lag+k])
+                sx+=x
+                sy+=y
+                sxx+=x*x
+                syy+=y*y
+                sxy+=x*y
+                valid+=1
+            float corrVal=0.0
+            if valid>1
+                float denomX=float(valid)*sxx-sx*sx
+                float denomY=float(valid)*syy-sy*sy
+                float denom=denomX*denomY
+                corrVal:=denom>0.0?(float(valid)*sxy-sx*sy)/math.sqrt(denom):0.0
+            array.set(corr,lag,corrVal)
+    for period=minPeriod to maxPeriod
+        float cosAcc=0.0
+        float sinAcc=0.0
+        for n=2 to maxPeriod
+            float corrVal=array.get(corr,n)
+            float angle=2.0*math.pi*float(n)/float(period)
+            cosAcc+=corrVal*math.cos(angle)
+            sinAcc+=corrVal*math.sin(angle)
+        float sq=cosAcc*cosAcc+sinAcc*sinAcc
+        array.set(smooth,period,0.2*sq*sq+0.8*array.get(smooth,period))
+    float localMaxPwr=0.0
+    for period=minPeriod to maxPeriod
+        float smoothVal=array.get(smooth,period)
+        if smoothVal>localMaxPwr
+            localMaxPwr:=smoothVal
+    float diff=float(maxPeriod-minPeriod)
+    float K=diff>0?math.pow(10.0,-0.15/diff):1.0
+    if localMaxPwr>maxPwr
+        maxPwr:=localMaxPwr
+    else
+        maxPwr:=K*maxPwr
+    float weighted=0.0
+    float sumWeight=0.0
+    float peakPwr=0.0
+    for period=minPeriod to maxPeriod
+        float smoothVal=array.get(smooth,period)
+        float pwr=maxPwr>0.0?smoothVal/maxPwr:0.0
+        if enhance
+            pwr:=math.pow(pwr,3.0)
+        array.set(power,period,pwr)
+        if pwr>peakPwr
+            peakPwr:=pwr
+        if pwr>=0.5
+            weighted+=float(period)*pwr
+            sumWeight+=pwr
+    float base=sumWeight>=0.25?weighted/sumWeight:dom
+    float alpha=0.2
+    float beta=1.0-alpha
+    dom:=alpha*(base-dom)+dom
+    if warmup
+        e*=beta
+        float c=1.0/(1.0-e)
+        dom:=c*dom
+        warmup:=e>1e-10
+    dom
+
+superSmoother(src, length) =>
+    omega = math.pi * math.sqrt(2.0) / length
+    alpha = math.exp(-omega)
+    coef2 = 2.0 * alpha * math.cos(omega)
+    coef3 = -math.pow(alpha, 2)
+    coef1 = 1.0 - coef2 - coef3
+    filt  = src
+    if bar_index > 2
+        mid = (src + src[1]) / 2
+        filt := (coef1 * mid) +
+          		(coef2 * nz(filt[1])) +
+          		(coef3 * nz(filt[2]))
+    filt
+
+superSmoother3(src, length) =>
+    // length := math.max(1, length)
+    omega = math.pi * math.sqrt(3.0) / length
+    alpha = math.exp(-math.pi / length)
+    beta = 2.0 * alpha * math.cos(omega)
+    gamma = math.pow(alpha, 2)
+    coef2 = beta + gamma
+    coef3 = -(gamma + (beta * gamma))
+    coef4 = math.pow(gamma, 2)
+    coef1 = 1.0 - coef2 - coef3 - coef4
+    filt = src
+    if bar_index > 3
+        filt := (coef1 * nz(src, src[1])) +
+             (coef2 * nz(filt[1])) +
+             (coef3 * nz(filt[2])) +
+             (coef4 * nz(filt[3]))
+    filt
+
+clamp(val, lo, hi) =>
+    math.max(lo, math.min(hi, val))
+
+ewma(src, alpha) =>
+    ma = src
+    ma := alpha * src + (1.0 - alpha) * nz(ma[1], src)
+
+ema(src, period) =>
+    alpha = 2.0 / (period + 1.0)
+    ewma(src, alpha)
+
+ema2(source, period) =>
+    float alpha = 2.0 / (period / math.sqrt(2) + 1.0)
+    ewma(ewma(source, alpha), alpha)
+
+//────────────────────────────────────────────
+// Inputs
+//────────────────────────────────────────────
+src = input(close, title="Source", inline = "src")
+minPeriod = input.int(8, "Min Dominant Cycle", minval=5)
+maxPeriod = input.int(48, "Max Dominant Cycle", minval=10)
+
+maType = input.string("SSF", "Moving", inline = "src",
+     options = ["SSF", "EMA", "SSF3", "EMA2"])
+
+k = input.float(
+    1.6, title = "Expansion Multiplier",
+    minval = 1.0, step = 0.1, inline = "lens",
+    tooltip= "Harmonic spacing ratio for cycle layers:\n" +
+	          "• 1.26 = Third-Octave\n" + "• 1.414 = Half-Octave\n" +
+	          "• 1.618 = Golden Ratio\n" + "• 2.0 = Full Octave"
+)
+
+//────────────────────────────────────────────
+// Cloud Styling
+//────────────────────────────────────────────
+bullishColor1 = input.color(color.rgb(176, 190, 197), title="Bullish", inline="Clr")
+bearishColor1 = input.color(color.rgb(141, 110, 99), title="Bearish", inline="Clr")
+fillTrans1 = input.int(35, title="Transparency:", inline="Clr")
+
+bullishColor2 = input.color(color.rgb(255, 193, 7), title="Bullish", inline="Clr2")
+bearishColor2 = input.color(color.rgb(30, 136, 229), title="Bearish", inline="Clr2")
+fillTrans2 = input.int(45, title="Transparency:", inline="Clr2")
+
+// ─────────────────────────────
+// Dominant Cycle Estimation
+// ─────────────────────────────
+DC_raw = acp_dc(src, minPeriod, maxPeriod)
+
+// Safety clamp to prevent filter collapse
+DC_per = clamp(DC_raw, minPeriod, maxPeriod)
+
+//────────────────────────────────────────────
+// Derived Lengths
+//────────────────────────────────────────────
+len1 = math.max(1, int(DC_per / k))
+len2 = DC_per
+len3 = math.max(1, int(DC_per * k))
+len4 = math.max(1, int(DC_per * k * k))
+
+//────────────────────────────────────────────
+// MA Engine
+//────────────────────────────────────────────
+maCalc(src, len, maType) =>
+    switch maType
+        "EMA" => ema(src, len)
+        "SSF" => superSmoother(src, len)
+        "EMA2" => ema2(src, len)
+        "SSF3" => superSmoother3(src, len)
+
+maFunc(len) =>
+    maCalc(src, len, maType)
+
+//────────────────────────────────────────────
+// MA Calculations
+//────────────────────────────────────────────
+fastMA1 = maFunc(len1)
+slowMA1 = maFunc(len2)
+
+fastMA2 = maFunc(len3)
+slowMA2 = maFunc(len4)
+
+//────────────────────────────────────────────
+// Cloud Colors
+//────────────────────────────────────────────
+trend1Color = fastMA1 > slowMA1 ? bullishColor1 : bearishColor1
+trend2Color = fastMA2 > slowMA2 ? bullishColor2 : bearishColor2
+
+MA1Cloud = color.new(trend1Color, fillTrans1)
+MA2Cloud = color.new(trend2Color, fillTrans2)
+
+//────────────────────────────────────────────
+// Plot Clouds
+//────────────────────────────────────────────
+
+plotFast1 = plot(fastMA1, color=trend1Color, title="Fast MA 1", display=display.none)
+plotSlow1 = plot(slowMA1, color=trend1Color, title="Slow MA 1", display=display.none)
+fill(plotFast1, plotSlow1, color=MA1Cloud)
+
+plotFast2 = plot(fastMA2, color=trend2Color, title="Fast MA 2", display=display.none)
+plotSlow2 = plot(slowMA2, color=trend2Color, title="Slow MA 2", display=display.none)
+fill(plotFast2, plotSlow2, color=MA2Cloud)
